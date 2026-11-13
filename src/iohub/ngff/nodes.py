@@ -3,12 +3,14 @@
 # TODO: remove this in the future (PEP deferred for 3.11, now 3.12?)
 from __future__ import annotations
 
+import glob
 import itertools
 import logging
 import math
 import os
 import shutil
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
 from functools import cached_property
@@ -26,6 +28,7 @@ import zarr
 from natsort import natsorted
 from numpy.typing import ArrayLike, DTypeLike, NDArray
 from pydantic import ValidationError
+from zarr.storage import LocalStore
 
 from iohub.core import ArraySpec, NGFFArray, get_implementation
 from iohub.core.compat import get_ome_attrs, zarr_format_for_version
@@ -3664,3 +3667,137 @@ def open_ome_zarr(
         impl=impl,
         **kwargs,
     )
+
+
+def _store_dirpath(node: NGFFNode) -> Path | None:
+    """Directory of a node in a local filesystem store; None for any other store."""
+    store = node.zgroup.store
+    if isinstance(store, LocalStore):
+        return Path(store.root, node.zgroup.path)
+    return None
+
+
+def _open_matches(
+    pattern: str | os.PathLike[str],
+    mode: Literal["r", "r+"],
+    opened: list[NGFFNode],
+) -> list[Position | Plate]:
+    """Open the directories a path or glob pattern matches; ``opened`` collects every node opened."""
+    path = Path(pattern)
+    # An existing path is taken as it is, so a name with glob characters such as "[" opens.
+    # glob.glob (not Path.glob) handles absolute patterns.
+    matches = [path] if path.exists() else [Path(m) for m in natsorted(glob.glob(os.fspath(pattern)))]  # noqa: PTH207
+    if not matches:
+        raise FileNotFoundError(f"No file or directory matches {os.fspath(pattern)!r}.")
+    nodes: list[Position | Plate] = []
+    for match in matches:
+        # A glob that the shell expanded also passes files, such as a well's zarr.json.
+        if not match.is_dir():
+            continue
+        try:
+            node = open_ome_zarr(match, mode=mode)
+        except (KeyError, ValueError, StoreOpenError) as err:
+            raise ValueError(f"{match} is not an OME-Zarr position or plate.") from err
+        opened.append(node)
+        if not isinstance(node, Position | Plate):
+            raise ValueError(
+                f"{match} is a bioformats2raw collection, not an OME-Zarr position or plate; "
+                f"name its images instead, for example {match / '0'}."
+            )
+        nodes.append(node)
+    return nodes
+
+
+@contextmanager
+def open_positions(
+    positions: str | os.PathLike[str] | Position | Plate | Iterable[str | os.PathLike[str] | Position | Plate],
+    mode: Literal["r", "r+"] = "r",
+) -> Generator[list[Position]]:
+    """Open the positions that paths, glob patterns, and plates name.
+
+    A context manager that gives a list of
+    [`Position`][iohub.ngff.Position] objects.
+    The nodes it opens are closed when the ``with`` block exits;
+    the open nodes passed in are left open.
+
+    Parameters
+    ----------
+    positions : str, PathLike, Position, Plate, or an iterable of these
+        One item or several. Each item is one of:
+
+        - the path to a position: an HCS position such as
+          ``plate.zarr/A/1/0``, or a single-FOV store;
+        - the path to a plate, which selects all of its positions;
+        - a glob pattern such as ``plate.zarr/*/*/*``, as `glob.glob`
+          expands it, whose matches are positions or plates;
+        - an open ``Position``, which is given back as it is;
+        - an open ``Plate``, which selects all of its positions.
+
+        Items keep the order given. The matches of a pattern and the
+        positions of a plate are in natural order (``A/2`` before ``A/10``).
+        A position named twice is given once, where it first appears.
+        Files that a path or pattern matches are skipped, because a glob
+        expanded by the shell also passes files such as a well's
+        ``zarr.json``.
+    mode : Literal["r", "r+"], optional
+        Mode to open paths in: 'r' means read only,
+        'r+' means read/write, by default "r".
+        With 'r+', open nodes passed in must be writable.
+
+    Yields
+    ------
+    list[Position]
+        The selected positions.
+
+    Raises
+    ------
+    FileNotFoundError
+        If a path or pattern matches nothing.
+    ValueError
+        If a matched directory is not an OME-Zarr position or plate,
+        if the items select no position,
+        if ``mode`` is not 'r' or 'r+',
+        or if ``mode`` is 'r+' and an open node passed in is read-only.
+    TypeError
+        If an item is not a path, a ``Position``, or a ``Plate``.
+
+    Examples
+    --------
+    >>> from iohub.ngff import open_positions
+    >>> with open_positions(["plate.zarr/A/*/*", "fov.zarr"]) as positions:
+    >>>     for position in positions:
+    >>>         print(position.zgroup.path, position.data.shape)
+    """
+    if mode not in ("r", "r+"):
+        raise ValueError(f"mode must be 'r' or 'r+' to open existing positions, got {mode!r}.")
+    items = [positions] if isinstance(positions, str | os.PathLike | NGFFNode) else list(positions)
+    opened: list[NGFFNode] = []
+    found: dict[Path | tuple[str, str], Position] = {}
+    try:
+        for item in items:
+            if isinstance(item, Position | Plate):
+                if mode == "r+" and item.zgroup.read_only:
+                    where = _store_dirpath(item) or item.zgroup.store
+                    raise ValueError(f"The {type(item).__name__} at {where} is open read-only; open it with mode='r+'.")
+                nodes = [item]
+            elif isinstance(item, str | os.PathLike):
+                nodes = _open_matches(item, mode, opened)
+            else:
+                raise TypeError(f"Expected a path, a glob pattern, a Position, or a Plate, got {type(item).__name__}.")
+            for node in nodes:
+                if isinstance(node, Position):
+                    members = [node]
+                else:
+                    members = natsorted((p for _, p in node.positions()), key=lambda p: p.zgroup.path)
+                for position in members:
+                    key = _store_dirpath(position) or (str(position.zgroup.store), position.zgroup.path)
+                    found.setdefault(key, position)
+        if not found:
+            names = [os.fspath(i) if isinstance(i, str | os.PathLike) else type(i).__name__ for i in items]
+            raise ValueError(
+                f"No OME-Zarr positions in {names}: matched files are skipped, and a plate may have no positions."
+            )
+        yield list(found.values())
+    finally:
+        for node in opened:
+            node.close()

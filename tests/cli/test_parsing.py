@@ -59,6 +59,24 @@ def test_expand_no_match_raises(tmpdir):
         expand_position_dirpaths([str(tmpdir / "does_not_exist" / "*")])
 
 
+def test_expand_lists_a_position_once(tmpdir):
+    plate_path, _ = _make_plate(tmpdir)
+    processed = expand_position_dirpaths([str(plate_path / "B" / "2" / "0"), str(plate_path)])
+    assert [p.parts[-3:] for p in processed] == [("B", "2", "0"), ("A", "1", "0"), ("X", "4", "1")]
+
+
+def test_expand_refuses_a_pattern_that_matches_nothing_among_others(tmpdir):
+    plate_path, _ = _make_plate(tmpdir)
+    with pytest.raises(typer.BadParameter, match="typo"):
+        expand_position_dirpaths([str(plate_path), str(tmpdir / "typo.zarr")])
+
+
+def test_expand_refuses_a_directory_that_is_not_a_position(tmpdir):
+    plate_path, _ = _make_plate(tmpdir)
+    with pytest.raises(typer.BadParameter, match="not an OME-Zarr position or plate"):
+        expand_position_dirpaths([str(plate_path / "A" / "1")])
+
+
 def _eat_all_app():
     """A tiny Typer app whose -i uses the shared InputPositionDirpaths type."""
     app = typer.Typer()
