@@ -11,6 +11,7 @@ import shutil
 from collections.abc import Generator
 from copy import deepcopy
 from datetime import datetime
+from fractions import Fraction
 from functools import cached_property
 from pathlib import Path
 from typing import (
@@ -63,6 +64,7 @@ from iohub.ngff.models import (
     PositionLabelMeta,
     RDefsMeta,
     SpaceAxisMeta,
+    SpaceUnit,
     TimeAxisMeta,
     TransformationMeta,
     WellGroupMeta,
@@ -171,6 +173,39 @@ LABEL_PYRAMID_METHODS = ("max", "min", "stride", "mode")
 def _scale_dims(values: tuple[int, ...], axes: set[int]) -> tuple[int, ...]:
     """Halve values at the given indices, rounding up (ceiling division)."""
     return tuple(math.ceil(v / 2) if i in axes else v for i, v in enumerate(values))
+
+
+# The OME-NGFF space units in meters, exact except the parsec (the IAU
+# 648000/pi astronomical units, to 17 digits), so a conversion is the correctly
+# rounded value: 0.65 micrometer is 650.0 nanometer, not 650.0000000000001.
+_METERS_PER_SPACE_UNIT: dict[SpaceUnit, Fraction] = {
+    "angstrom": Fraction(10) ** -10,
+    "attometer": Fraction(10) ** -18,
+    "centimeter": Fraction(10) ** -2,
+    "decimeter": Fraction(10) ** -1,
+    "exameter": Fraction(10) ** 18,
+    "femtometer": Fraction(10) ** -15,
+    "foot": Fraction("0.3048"),
+    "gigameter": Fraction(10) ** 9,
+    "hectometer": Fraction(10) ** 2,
+    "inch": Fraction("0.0254"),
+    "kilometer": Fraction(10) ** 3,
+    "megameter": Fraction(10) ** 6,
+    "meter": Fraction(1),
+    "micrometer": Fraction(10) ** -6,
+    "mile": Fraction("1609.344"),
+    "millimeter": Fraction(10) ** -3,
+    "nanometer": Fraction(10) ** -9,
+    "parsec": Fraction("3.0856775814913673e16"),
+    "petameter": Fraction(10) ** 15,
+    "picometer": Fraction(10) ** -12,
+    "terameter": Fraction(10) ** 12,
+    "yard": Fraction("0.9144"),
+    "yoctometer": Fraction(10) ** -24,
+    "yottameter": Fraction(10) ** 24,
+    "zeptometer": Fraction(10) ** -21,
+    "zettameter": Fraction(10) ** 21,
+}
 
 
 def _case_insensitive_local_fs() -> bool:
@@ -968,6 +1003,10 @@ class MultiscaleNode(NGFFNode):
         Helper function for scale transform metadata of
 
         highest resolution scale.
+
+        The numbers are in the units of the axes;
+        [`voxel_size`][iohub.ngff.nodes.MultiscaleNode.voxel_size] converts
+        the space axes to one length unit.
         """
         return self.get_effective_scale(self.metadata.multiscales[0].datasets[0].path)
 
@@ -1053,6 +1092,69 @@ class MultiscaleNode(NGFFNode):
                 full_scale *= np.array(transform.scale)
 
         return [float(x) for x in full_scale]
+
+    def voxel_size(self, unit: SpaceUnit = "micrometer", *, image: str | None = None) -> tuple[float, ...]:
+        """Physical size of a voxel of one resolution level along the space axes.
+
+        Takes the effective scale of the level (see
+        [`get_effective_scale`][iohub.ngff.nodes.MultiscaleNode.get_effective_scale])
+        on the axes of type ``"space"``, in axis order, and converts each from
+        the unit its axis declares to ``unit``.
+
+        Parameters
+        ----------
+        unit : SpaceUnit, optional
+            Length unit of the result, one of the OME-NGFF space units
+            (e.g. ``"nanometer"``), by default ``"micrometer"``.
+        image : str, optional
+            Path of the resolution level (e.g. ``"1"``), by default the
+            highest resolution level (the first dataset of the multiscales
+            metadata).
+
+        Returns
+        -------
+        tuple[float, ...]
+            One size per space axis, in axis order: ``(z, y, x)`` for a TCZYX
+            image, ``(y, x)`` for a CYX image.
+
+        Raises
+        ------
+        ValueError
+            If ``unit`` is not an OME-NGFF space unit, ``image`` is not a
+            resolution level, or a space axis declares no unit, whose scale
+            then has no known length (read it with `get_effective_scale`).
+
+        Examples
+        --------
+        >>> position.voxel_size()
+        (2.0, 0.65, 0.65)
+        >>> position.voxel_size("nanometer", image="1")
+        (4000.0, 1300.0, 1300.0)
+        """
+        if unit not in _METERS_PER_SPACE_UNIT:
+            raise ValueError(
+                f"Unknown length unit {unit!r}; use one of the OME-NGFF space units: "
+                f"{', '.join(_METERS_PER_SPACE_UNIT)}."
+            )
+        levels = self.metadata.multiscales[0].get_dataset_paths()
+        if image is None:
+            image = levels[0]
+        elif image not in levels:
+            raise ValueError(f"{image!r} is not a resolution level of this image; its levels are {levels}.")
+        sizes = []
+        for axis, scale in zip(self.axes, self.get_effective_scale(image), strict=True):
+            if axis.type != "space":
+                continue
+            meters = _METERS_PER_SPACE_UNIT.get(axis.unit)
+            if meters is None:
+                declared = "declares no unit" if axis.unit is None else f"has unit {axis.unit!r}, not a length"
+                raise ValueError(
+                    f"Space axis {axis.name!r} {declared}, so its scale cannot be converted to {unit}. "
+                    "Set the axis unit in the multiscales metadata, or read the scale as stored with "
+                    "`get_effective_scale`."
+                )
+            sizes.append(float(Fraction(scale) * meters / _METERS_PER_SPACE_UNIT[unit]))
+        return tuple(sizes)
 
 
 def check_label_shape(shape: tuple[int, ...], axes: list[AxisMeta]) -> None:
