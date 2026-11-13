@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import glob
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 import typer
-from natsort import natsorted
 from typer.core import TyperGroup, TyperOption
 
 if TYPE_CHECKING:
@@ -21,28 +19,22 @@ __all__ = [
 
 
 def expand_position_dirpaths(patterns: list[str]) -> list[Path]:
-    """Expand position paths, plate roots, and globs into directory paths.
+    """Expand position paths, plate roots, and globs into position directory paths.
 
-    Plate roots select all positions in the plate. File matches are skipped.
-    Raise ``typer.BadParameter`` if no directories match.
+    Patterns are selected as [`open_positions`][iohub.ngff.open_positions]
+    selects them: plate roots select all positions in the plate, file matches
+    are skipped, and a position named twice is listed once.
+    Raise ``typer.BadParameter`` if a pattern matches nothing,
+    matches a directory that is not a position or plate, or if no position is found.
     """
-    from iohub.ngff import Plate, open_ome_zarr
+    from iohub.ngff import open_positions
+    from iohub.ngff.nodes import _store_dirpath
 
-    positions: list[Path] = []
-    for pattern in patterns:
-        # glob.glob (not Path.glob) handles absolute patterns.
-        for match in natsorted(glob.glob(pattern)):  # noqa: PTH207
-            path = Path(match)
-            if not path.is_dir():
-                continue
-            with open_ome_zarr(path, mode="r") as node:
-                if isinstance(node, Plate):
-                    positions.extend(path / name for name, _ in node.positions())
-                else:
-                    positions.append(path)
-    if not positions:
-        raise typer.BadParameter(f"No positions matched: {list(patterns)}")
-    return positions
+    try:
+        with open_positions(patterns) as positions:
+            return [_store_dirpath(position) for position in positions]
+    except (FileNotFoundError, ValueError) as err:
+        raise typer.BadParameter(str(err)) from err
 
 
 class OptionEatAll(TyperOption):

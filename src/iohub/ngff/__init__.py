@@ -9,6 +9,7 @@ from iohub.ngff.nodes import (
     TiledImageArray,
     TiledPosition,
     open_ome_zarr,
+    open_positions,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "TiledPosition",
     "TransformationMeta",
     "open_ome_zarr",
+    "open_positions",
 ]

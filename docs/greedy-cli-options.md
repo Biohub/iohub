@@ -41,8 +41,11 @@ python positions.py process -i input.zarr
 python positions.py process -i 'input.zarr/A/*/*'
 ```
 
-`expand_position_dirpaths` expands plate roots and globs, skips file matches,
-and raises `typer.BadParameter` if no directories match.
+`expand_position_dirpaths` selects positions as
+[`open_positions`][iohub.ngff.open_positions] does: it expands
+plate roots and globs, skips file matches, and lists a position named twice
+once. It raises `typer.BadParameter` if a pattern matches nothing or matches
+a directory that is not a position or plate, or if no position is found.
 `install_eat_all_positions` updates the group's immediate commands. It looks
 for the parameter name `input_position_dirpaths`, so keep that name in your
 command.

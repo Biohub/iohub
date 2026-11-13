@@ -8,6 +8,7 @@ import warnings
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from fnmatch import fnmatchcase
 from functools import partial
 from pathlib import Path
@@ -28,7 +29,7 @@ from iohub.ngff._write_units import (
     tracking_available,
     unit_is_complete,
 )
-from iohub.ngff.nodes import TransformationMeta
+from iohub.ngff.nodes import Position, TransformationMeta, _store_dirpath
 
 #: Default ZYX chunk size for OME-Zarr v0.5 stores: ~2 MB at uint16 / ~4 MB at float32.
 _V05_DEFAULT_ZYX_CHUNKS: tuple[int, int, int] = (16, 256, 256)
@@ -740,6 +741,26 @@ def create_empty_labels(
 # -- Transform helpers -----------------------------------------------------
 
 
+def _position_dirpath(position: Position | Path, *, writable: bool = False) -> Path:
+    """The path a position is reopened from, here and in worker processes.
+
+    A path is returned as it is. An open position gives its directory, so it
+    must be in a local directory store; an output position (``writable``)
+    must also be open for writing, since the writes go through that directory.
+    """
+    if not isinstance(position, Position):
+        return position
+    path = _store_dirpath(position)
+    if path is None:
+        raise ValueError(
+            f"The position {position.zgroup.path!r} is in a {type(position.zgroup.store).__name__}, "
+            "which cannot be reopened from a path; pass a position in a local directory store."
+        )
+    if writable and position.zgroup.read_only:
+        raise ValueError(f"The output position at {path} is open read-only; open it with mode='r+'.")
+    return path
+
+
 def _apply_transform_to_czyx(
     func: Callable[[NDArray, Any], NDArray],
     input_position_path: Path,
@@ -892,8 +913,8 @@ def _plan_output_write(
 
 def apply_transform_to_tczyx_and_save(
     func: Callable[[NDArray, Any], NDArray],
-    input_position_path: Path,
-    output_position_path: Path,
+    input_position_path: Path | Position,
+    output_position_path: Path | Position,
     input_channel_indices: list[int] | slice,
     output_channel_indices: list[int] | slice,
     input_time_indices: list[int] | slice,
@@ -914,7 +935,11 @@ def apply_transform_to_tczyx_and_save(
     ``resume=True`` to skip a unit that a previous run already finished.
     With ``output_label`` the result goes into that label image of the output
     position instead of its image (see `process_single_position`).
+    The positions are paths or open positions, as `process_single_position`
+    takes them.
     """
+    input_position_path = _position_dirpath(input_position_path)
+    output_position_path = _position_dirpath(output_position_path, writable=True)
     unit, already_written = _plan_output_write(
         output_position_path,
         output_channel_indices,
@@ -1022,8 +1047,8 @@ def _available_cpus() -> int:
 
 def process_single_position(
     func: Callable[[NDArray, Any], NDArray],
-    input_position_path: Path,
-    output_position_path: Path,
+    input_position_path: Path | Position,
+    output_position_path: Path | Position,
     input_channel_indices: list[slice] | list[list[int]] | None = None,
     output_channel_indices: list[slice] | list[list[int]] | None = None,
     input_time_indices: list[int] | None = None,
@@ -1046,13 +1071,15 @@ def process_single_position(
         The function to be applied to the data.
         func must take the CZYX NDArray as the first argument and return
         a CZXY NDArray. Additional arguments are passed through **kwargs.
-    input_position_path : Path
-        The path to the input OME-Zarr position store
-        (e.g., input_store_path.zarr/A/1/0).
-    output_position_path : Path
-        The path to the output OME-Zarr position store
-        (e.g., output_store_path.zarr/A/1/0). May be the input position
-        when writing into one of its label images (``output_label``).
+    input_position_path : Path or Position
+        The input OME-Zarr position: its path
+        (e.g., input_store_path.zarr/A/1/0), or an open
+        [`Position`][iohub.ngff.Position] in a local directory store.
+    output_position_path : Path or Position
+        The output OME-Zarr position: its path
+        (e.g., output_store_path.zarr/A/1/0), or a ``Position`` open for
+        writing (mode 'r+') in a local directory store. May be the input
+        position when writing into one of its label images (``output_label``).
     output_label : str, optional
         Write into the label image ``labels/<output_label>`` of the output
         position (created beforehand, e.g. by ``create_empty_plate``'s
@@ -1117,7 +1144,23 @@ def process_single_position(
         ``metadata_sources``) it is overwritten and a warning is raised.
         Reserved OME-Zarr keys (``ome``, ``multiscales``, ``omero``,
         ``labels``, ``version``) are rejected with a ``ValueError``.
+
+    Notes
+    -----
+    An open position passed in is reopened from its directory, here and in
+    the worker processes (which cannot receive an open node), with the
+    default zarr implementation; the node itself is left open. iohub does not
+    buffer writes: what was written through the node before this call is in
+    the store and is read here, and the node reads the new data afterwards.
+    Metadata changed on the node in memory but not written (``dump_meta``)
+    is not seen. ``extra_metadata`` is written through the output node, not
+    another handle: a node caches its attributes, and its next metadata
+    write would otherwise drop keys written by someone else.
     """
+    # Positions are reopened from their directories; only extra_metadata uses the caller's node.
+    output_position = output_position_path if isinstance(output_position_path, Position) else None
+    input_position_path = _position_dirpath(input_position_path)
+    output_position_path = _position_dirpath(output_position_path, writable=True)
     click.echo(f"Function to be applied: \t{func}")
     click.echo(f"Input data path:\t{input_position_path}")
     click.echo(f"Output data path:\t{output_position_path}")
@@ -1188,7 +1231,12 @@ def process_single_position(
     # clobbering upstream provenance.
     extra_metadata = _validated_extra_metadata(kwargs.pop("extra_metadata", None))
     if extra_metadata:
-        with open_ome_zarr(output_position_path, layout="fov", mode="r+") as output_dataset:
+        output_dataset_context = (
+            nullcontext(output_position)
+            if output_position is not None
+            else open_ome_zarr(output_position_path, layout="fov", mode="r+")
+        )
+        with output_dataset_context as output_dataset:
             for key, value in extra_metadata.items():
                 if key in output_dataset.zattrs:
                     warnings.warn(

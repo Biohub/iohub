@@ -6,6 +6,8 @@
     options:
       show_overloads: false
 
+::: iohub.ngff.open_positions
+
 ## NGFF Nodes
 
 ::: iohub.ngff.NGFFNode

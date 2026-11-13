@@ -17,7 +17,10 @@ iohub compute-pyramid -i 'input.zarr/A/*/*' --levels 4
 iohub set-scale -i input.zarr/A/1/0 input.zarr/B/2/0 -z 2
 ```
 
-iohub expands quoted globs. Your shell expands unquoted ones.
+iohub expands quoted globs. Your shell expands unquoted ones. Each path or
+pattern must match something, and a position named twice is processed once.
+In Python, [`open_positions`][iohub.ngff.open_positions] selects
+positions the same way.
 
 To use these options in another Typer CLI, see
 [Options with multiple values](greedy-cli-options.md).
