@@ -120,10 +120,10 @@ The project uses [dependency groups](https://docs.astral.sh/uv/concepts/projects
 |-------|---------|
 | `test` | Testing tools (pytest, hypothesis, etc.) |
 | `acquire-zarr` | Acquire-zarr reader (requires glibc 2.35+) |
-| `torch` | CPU build of PyTorch, for the tests of `process_single_position(torch_device=...)` |
+| `torch` | CPU build of PyTorch, for the tests of `process_single_position(torch_device=...)` (not in `dev`) |
 | `doc` | Documentation (zensical, mkdocstrings, etc.) |
 | `pre-commit` | Pre-commit hooks |
-| `dev` | Includes test, acquire-zarr, torch, doc, pre-commit (installed by default via `uv sync`) |
+| `dev` | Includes test, acquire-zarr, doc, pre-commit (installed by default via `uv sync`) |
 
 > **Note**: On older glibc systems (e.g., Rocky Linux 8), `acquire-zarr` won't work. Use `uv sync --no-group acquire-zarr` instead.
 
@@ -157,6 +157,14 @@ Local test runs and coverage check can be invoked by:
 
 ```sh
 # in the project root directory
+uv run pytest --cov=iohub tests/
+```
+
+The tests of `process_single_position(torch_device=...)` need PyTorch and are skipped without it.
+To run them, install the `torch` group (CPU wheels) first:
+
+```sh
+uv sync --group torch
 uv run pytest --cov=iohub tests/
 ```
 

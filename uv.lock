@@ -809,8 +809,6 @@ dev = [
     { name = "pytest-xdist" },
     { name = "requests" },
     { name = "ruff" },
-    { name = "torch", version = "2.15.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
-    { name = "torch", version = "2.15.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
     { name = "wget" },
     { name = "zensical" },
 ]
@@ -878,7 +876,6 @@ dev = [
     { name = "pytest-xdist", specifier = ">=3.8.0" },
     { name = "requests", specifier = ">=2.22.0" },
     { name = "ruff", specifier = ">=0.16.5" },
-    { name = "torch", specifier = ">=2.9", index = "https://download.pytorch.org/whl/cpu" },
     { name = "wget", specifier = ">=3.2" },
     { name = "zensical", specifier = ">=0.0.57" },
 ]

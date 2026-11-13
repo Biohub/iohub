@@ -77,6 +77,7 @@ test = [
 acquire-zarr = [
     "acquire-zarr",
 ]
+# Not in dev, so a plain `uv sync` does not download it; CI adds `--group torch`.
 # 2.9 is the first torch with wheels for every Python iohub supports (3.12-3.14).
 torch = [
     "torch>=2.9",
@@ -92,7 +93,6 @@ doc = [
 dev = [
     { include-group = "test" },
     { include-group = "acquire-zarr" },
-    { include-group = "torch" },
     { include-group = "doc" },
 ]
 
