@@ -6,6 +6,8 @@ import os
 import shutil
 import string
 import struct
+import subprocess
+import sys
 from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
@@ -29,6 +31,7 @@ from iohub.ngff.utils import (
     _contiguous_runs,
     _indices_to_shard_aligned_batches,
     _match_indices_to_batches,
+    _TensorTransform,
     apply_transform_to_tczyx_and_save,
     create_empty_labels,
     create_empty_plate,
@@ -3122,3 +3125,193 @@ def test_apply_transform_label_output_ignores_the_channel_selection(tmp_path):
         labels = position.get_label("nuclei")["0"][:]
         assert labels.shape == (2, 1, 3, 8, 8)
         np.testing.assert_array_equal(labels[:, 0], np.rint(position.data[:, 1] * 2).astype(np.uint32))
+
+
+# -- torch tensors in and out of the transform -----------------------------
+
+
+def _tensor_transform(data, constant=2, call_log_dir=None, device="cpu"):
+    """counting_transform for a tensor on ``device``, returned there."""
+    import torch
+
+    assert isinstance(data, torch.Tensor)
+    assert data.device.type == torch.device(device).type
+    return counting_transform(data, constant=constant, call_log_dir=call_log_dir)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(("num_workers", "use_threads"), [(1, False), (2, False), (2, True)])
+def test_process_single_position_with_torch_device(tmp_path, device, num_workers, use_threads):
+    """func gets tensors on the device; skip, resume and kwargs behave as with numpy."""
+    torch = pytest.importorskip("torch")
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    shape = (4, 2, 4, 8, 8)
+    position_key = ("A", "1", "0")
+    input_store, output_store = _make_stores(tmp_path, shape, position_key)
+    with open_ome_zarr(input_store, mode="r+") as in_ds:
+        in_ds["/".join(position_key)].data[1] = 0
+    call_log = tmp_path / "calls"
+    run = partial(
+        process_single_position,
+        func=_tensor_transform,
+        input_position_path=input_store / Path(*position_key),
+        output_position_path=output_store / Path(*position_key),
+        num_workers=num_workers,
+        use_threads=use_threads,
+        torch_device=device,
+        constant=3,
+        call_log_dir=str(call_log),
+        device=device,
+    )
+
+    run(resume=True)
+    assert _call_count(call_log) == (shape[0] - 1) * shape[1], "the all-zero timepoint reached func"
+    run(resume=True)
+    assert _call_count(call_log) == (shape[0] - 1) * shape[1], "resume recomputed units that were already written"
+
+    with open_ome_zarr(input_store) as in_ds, open_ome_zarr(output_store) as out_ds:
+        expected = in_ds["/".join(position_key)].data[:] * 3
+        np.testing.assert_array_equal(out_ds["/".join(position_key)].data[:], expected)
+
+
+def _float32_with_time(data, input_time_index):
+    import torch
+
+    assert data.dtype == torch.float32
+    return data + input_time_index
+
+
+def test_process_single_position_torch_dtype_casts_uint16_input(tmp_path):
+    """torch_dtype casts the store's uint16 before func; input_time_index still reaches func."""
+    torch = pytest.importorskip("torch")
+    shape = (3, 1, 2, 8, 8)
+    position_key = ("A", "1", "0")
+    input_store = tmp_path / "input.zarr"
+    output_store = tmp_path / "output.zarr"
+    for store, dtype in ((input_store, np.uint16), (output_store, np.float32)):
+        create_empty_plate(store, [position_key], ["c0"], shape, dtype=dtype)
+    populate_store(input_store, [position_key], shape, np.uint16)
+
+    process_single_position(
+        _float32_with_time,
+        input_store / Path(*position_key),
+        output_store / Path(*position_key),
+        torch_device="cpu",
+        torch_dtype=torch.float32,
+    )
+
+    with open_ome_zarr(input_store) as in_ds, open_ome_zarr(output_store) as out_ds:
+        image = in_ds["/".join(position_key)].data[:].astype(np.float32)
+        expected = image + np.arange(shape[0], dtype=np.float32)[:, None, None, None, None]
+        np.testing.assert_array_equal(out_ds["/".join(position_key)].data[:], expected)
+
+
+def _with_gradients(data):
+    import torch
+
+    weight = torch.tensor(2.0, requires_grad=True)
+    result = data * weight
+    assert result.requires_grad
+    return result
+
+
+def _numpy_result(data):
+    return data.numpy() * 2
+
+
+@pytest.mark.parametrize("func", [_with_gradients, _numpy_result])
+def test_process_single_position_torch_result_forms(tmp_path, func):
+    """A result that requires grad is detached; a numpy result is written as is."""
+    pytest.importorskip("torch")
+    shape = (2, 1, 2, 8, 8)
+    position_key = ("A", "1", "0")
+    input_store, output_store = _make_stores(tmp_path, shape, position_key)
+
+    process_single_position(
+        func, input_store / Path(*position_key), output_store / Path(*position_key), torch_device="cpu"
+    )
+
+    with open_ome_zarr(input_store) as in_ds, open_ome_zarr(output_store) as out_ds:
+        expected = in_ds["/".join(position_key)].data[:] * 2
+        np.testing.assert_array_equal(out_ds["/".join(position_key)].data[:], expected)
+
+
+def _tensor_labels(data, constant=2):
+    import torch
+
+    return torch.round(data[:1] * constant).to(torch.int32)
+
+
+def test_process_single_position_torch_into_a_label_image(tmp_path):
+    pytest.importorskip("torch")
+    shape = (2, 2, 3, 8, 8)
+    position_key = ("A", "1", "0")
+    store = _make_labelled_store(tmp_path, shape, position_key, ["nuclei"])
+    position_path = store / Path(*position_key)
+
+    process_single_position(
+        _tensor_labels,
+        position_path,
+        position_path,
+        input_channel_indices=[[1]],
+        output_label="nuclei",
+        torch_device="cpu",
+        constant=3,
+    )
+
+    with open_ome_zarr(position_path, layout="fov") as position:
+        labels = position.get_label("nuclei")["0"][:]
+        np.testing.assert_array_equal(labels[:, 0], np.rint(position.data[:, 1] * 3).astype(np.uint32))
+
+
+def test_process_single_position_torch_refusals(tmp_path, monkeypatch):
+    shape = (1, 1, 2, 8, 8)
+    position_key = ("A", "1", "0")
+    input_store, output_store = _make_stores(tmp_path, shape, position_key)
+    run = partial(
+        process_single_position,
+        dummy_transform,
+        input_store / Path(*position_key),
+        output_store / Path(*position_key),
+    )
+
+    with pytest.raises(ValueError, match="pass torch_device too"):
+        run(torch_dtype="float32")
+    with monkeypatch.context() as patch:
+        patch.setitem(sys.modules, "torch", None)  # what `import torch` sees without torch installed
+        with pytest.raises(ImportError, match="torch_device needs PyTorch"):
+            run(torch_device="cpu")
+    pytest.importorskip("torch")
+    with pytest.raises(TypeError, match=r"torch_dtype must be a torch\.dtype"):
+        run(torch_device="cpu", torch_dtype=np.float32)
+
+
+def _read_only(array):
+    array.flags.writeable = False
+    return array
+
+
+@pytest.mark.filterwarnings("error")  # torch warns when handed a read-only array
+@pytest.mark.parametrize(
+    ("array", "shared"),
+    [
+        (np.arange(24, dtype=np.uint16).reshape(2, 3, 4), True),
+        (np.arange(24, dtype=np.float32).reshape(2, 4, 3).transpose(0, 2, 1), False),
+        (np.arange(24, dtype=np.float32).reshape(2, 3, 4)[:, ::-1], False),
+        (np.arange(24, dtype=">f4").reshape(2, 3, 4), False),
+        (_read_only(np.arange(24, dtype=np.float32).reshape(2, 3, 4)), False),
+    ],
+    ids=["c-contiguous", "transposed", "negative-strides", "big-endian", "read-only"],
+)
+def test_tensor_transform_shares_memory_only_when_it_can(array, shared):
+    torch = pytest.importorskip("torch")
+    transform = _TensorTransform(lambda tensor: tensor, torch.device("cpu"), None)
+    result = transform(array)
+    assert np.shares_memory(result, array) is shared
+    np.testing.assert_array_equal(result, array)
+
+
+def test_importing_iohub_does_not_import_torch():
+    code = "import sys, iohub.ngff.utils; assert 'torch' not in sys.modules"
+    subprocess.run([sys.executable, "-c", code], check=True)

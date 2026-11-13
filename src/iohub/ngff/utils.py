@@ -11,7 +11,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from fnmatch import fnmatchcase
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import click
 import numpy as np
@@ -29,6 +29,9 @@ from iohub.ngff._write_units import (
     unit_is_complete,
 )
 from iohub.ngff.nodes import TransformationMeta
+
+if TYPE_CHECKING:
+    import torch
 
 #: Default ZYX chunk size for OME-Zarr v0.5 stores: ~2 MB at uint16 / ~4 MB at float32.
 _V05_DEFAULT_ZYX_CHUNKS: tuple[int, int, int] = (16, 256, 256)
@@ -760,6 +763,50 @@ def _apply_transform_to_czyx(
         return None
 
 
+def _import_torch():
+    """Import PyTorch, which iohub does not install, for ``torch_device``."""
+    try:
+        import torch
+    except ImportError as error:
+        raise ImportError(
+            "torch_device needs PyTorch, which iohub does not install. "
+            "Install it as https://pytorch.org/get-started/locally/ describes, e.g. `pip install torch`."
+        ) from error
+    return torch
+
+
+class _TensorTransform:
+    """Call ``func`` with a torch tensor in place of the numpy array, and return numpy.
+
+    A class rather than a closure so that worker processes can unpickle it.
+    ``__wrapped__`` lets `inspect.signature` see ``func``'s own parameters,
+    which decide whether ``input_time_index`` is passed.
+    """
+
+    def __init__(self, func: Callable[..., Any], device: torch.device, dtype: torch.dtype | None) -> None:
+        self.__wrapped__ = func
+        self.device = device
+        self.dtype = dtype
+
+    def __call__(self, czyx: NDArray, **kwargs) -> Any:
+        import torch
+
+        # torch.from_numpy shares the array's memory, which func may write to:
+        # copy an array that is read-only or that torch refuses (negative
+        # strides, foreign byte order). The C-contiguous, writable, native
+        # array a read returns is shared as is.
+        czyx = np.require(czyx, czyx.dtype.newbyteorder("="), ("C", "W"))
+        # Move, then cast on the device: a blocking `.to(device, dtype)` casts
+        # on the host, 8x slower for 1 GiB of uint16 to float32 on an A40.
+        tensor = torch.from_numpy(czyx).to(self.device)
+        if self.dtype is not None:
+            tensor = tensor.to(self.dtype)
+        result = self.__wrapped__(tensor, **kwargs)
+        if isinstance(result, torch.Tensor):
+            return result.numpy(force=True)
+        return result
+
+
 def _echo_finished(
     time_index: int | list[int] | slice,
     channel_index: int | list[int] | slice,
@@ -1021,7 +1068,7 @@ def _available_cpus() -> int:
 
 
 def process_single_position(
-    func: Callable[[NDArray, Any], NDArray],
+    func: Callable[..., NDArray | torch.Tensor],
     input_position_path: Path,
     output_position_path: Path,
     input_channel_indices: list[slice] | list[list[int]] | None = None,
@@ -1033,6 +1080,8 @@ def process_single_position(
     resume: bool = False,
     resume_token: str = "",
     output_label: str | None = None,
+    torch_device: str | torch.device | None = None,
+    torch_dtype: torch.dtype | None = None,
     **kwargs,
 ) -> None:
     """
@@ -1042,10 +1091,11 @@ def process_single_position(
 
     Parameters
     ----------
-    func : Callable[[NDArray, Any], NDArray]
+    func : Callable[..., NDArray | torch.Tensor]
         The function to be applied to the data.
-        func must take the CZYX NDArray as the first argument and return
-        a CZXY NDArray. Additional arguments are passed through **kwargs.
+        func must take the CZYX NDArray (a ``torch.Tensor`` with
+        ``torch_device``) as the first argument and return a CZYX array.
+        Additional arguments are passed through **kwargs.
     input_position_path : Path
         The path to the input OME-Zarr position store
         (e.g., input_store_path.zarr/A/1/0).
@@ -1103,6 +1153,30 @@ def process_single_position(
         settings of the calling step. Mixed into each unit's identity so that
         ``resume=True`` after a parameter change recomputes rather than
         skipping work that would now produce different data. Defaults to "".
+    torch_device : str or torch.device, optional
+        Call ``func`` with a ``torch.Tensor`` on this device, e.g. ``"cuda:0"``
+        or ``"cpu"``, instead of a numpy array. Needs PyTorch, which iohub does
+        not install. The tensor shares memory with the array read from the
+        store (a copy is made only if that array is read-only, not
+        C-contiguous or not in native byte order), then moves to the device.
+        ``func`` may return a tensor on any device, with or without
+        gradients: it is detached and copied to host memory before writing.
+        Timepoints with an all-zero or all-NaN channel are still skipped
+        before the transfer. uint16, uint32 and uint64 input needs
+        torch>=2.3 (older torch has no such tensors and raises a
+        ``TypeError``), and even then torch has almost no operations on them:
+        pass ``torch_dtype`` too. Worker processes (``num_workers > 1``
+        without ``use_threads``) each import torch and create their own CUDA
+        context on the device, which costs GPU memory per worker. iohub starts
+        them with ``spawn``, not ``fork``, so CUDA's restriction on forked
+        processes does not apply, but ``func`` and ``kwargs`` must be
+        picklable. Threads (``use_threads=True``) share one context.
+        Defaults to None: ``func`` gets and returns numpy arrays.
+    torch_dtype : torch.dtype, optional
+        Cast the tensor to this dtype, e.g. ``torch.float32``, before calling
+        ``func``. The cast runs on ``torch_device`` after the transfer, so the
+        transfer moves the store's dtype (2 bytes per voxel for uint16).
+        Requires ``torch_device``. Defaults to None, the store's dtype.
     kwargs : dict, optional
         Additional arguments to pass to the function.
         An ``extra_metadata`` kwarg (a dict) can be passed to record per-step
@@ -1117,6 +1191,23 @@ def process_single_position(
         ``metadata_sources``) it is overwritten and a warning is raised.
         Reserved OME-Zarr keys (``ome``, ``multiscales``, ``omero``,
         ``labels``, ``version``) are rejected with a ``ValueError``.
+
+    Examples
+    --------
+    Subtract a camera offset on the first GPU; ``func`` gets a float32 CUDA
+    tensor and its result is written to ``output_path``:
+
+    >>> import torch
+    >>> def subtract_offset(czyx, offset):
+    ...     return (czyx - offset).clamp_(min=0)
+    >>> process_single_position(
+    ...     subtract_offset,
+    ...     input_path,
+    ...     output_path,
+    ...     torch_device="cuda:0",
+    ...     torch_dtype=torch.float32,
+    ...     offset=100.0,
+    ... )
     """
     click.echo(f"Function to be applied: \t{func}")
     click.echo(f"Input data path:\t{input_position_path}")
@@ -1178,6 +1269,14 @@ def process_single_position(
         raise ValueError(f"""input_time_indices = {input_time_indices} includes
             a time index beyond the maximum index of
             the dataset = {time_ubound}""")
+
+    if torch_device is not None:
+        torch = _import_torch()
+        if torch_dtype is not None and not isinstance(torch_dtype, torch.dtype):
+            raise TypeError(f"torch_dtype must be a torch.dtype such as torch.float32, got {torch_dtype!r}.")
+        func = _TensorTransform(func, torch.device(torch_device), torch_dtype)
+    elif torch_dtype is not None:
+        raise ValueError("torch_dtype casts the tensor that torch_device asks for; pass torch_device too, e.g. 'cpu'.")
 
     # Write extra metadata to the output store. Each entry is stored as a
     # top-level zattrs key rather than nested under a single "extra_metadata"
