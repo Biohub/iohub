@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from itertools import product
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, get_args
 
 import hypothesis.extra.numpy as npst
 import hypothesis.strategies as st
@@ -28,8 +28,9 @@ if TYPE_CHECKING:
 
 from iohub.core.compat import get_ome_attrs
 from iohub.core.utils import pad_shape
-from iohub.ngff.models import TO_DICT_SETTINGS
+from iohub.ngff.models import TO_DICT_SETTINGS, ChannelAxisMeta, SpaceAxisMeta, SpaceUnit, TimeAxisMeta
 from iohub.ngff.nodes import (
+    _METERS_PER_SPACE_UNIT,
     Bioformats2RawSeries,
     Plate,
     Position,
@@ -1366,6 +1367,121 @@ def test_position_scale(channels_and_random_5d, version):
     transform = [TransformationMeta(type="scale", scale=scale)]
     with _temp_ome_zarr(random_5d, channel_names, "0", transform=transform, version=version) as dataset:
         assert dataset.scale == scale
+
+
+def _write_scaled(path: Path, axes: list, shape: tuple[int, ...], scale: list[float], version: str = "0.5") -> None:
+    """Write a position with ``axes`` and one array of ``shape`` and ``scale``."""
+    channel_names = ["a"] if any(axis.type == "channel" for axis in axes) else []
+    with open_ome_zarr(
+        path, layout="fov", mode="w-", axes=axes, channel_names=channel_names, version=version
+    ) as position:
+        transform = [TransformationMeta(type="scale", scale=scale)]
+        position.create_zeros("0", shape=shape, dtype=np.uint8, transform=transform, check_shape=False)
+
+
+def _space_axes(*units: str) -> list[SpaceAxisMeta]:
+    """Space axes named the last ``len(units)`` of z, y, x, in ``units``."""
+    return [SpaceAxisMeta(name=name, unit=unit) for name, unit in zip("zyx"[-len(units) :], units, strict=True)]
+
+
+@pytest.mark.parametrize("version", ["0.4", "0.5"])
+@pytest.mark.parametrize(
+    ("axes", "shape", "scale", "micrometers", "nanometers"),
+    [
+        pytest.param(
+            [TimeAxisMeta(name="t", unit="second"), ChannelAxisMeta(name="c"), *_space_axes(*["nanometer"] * 3)],
+            (1, 1, 4, 8, 8),
+            [5.0, 1.0, 250.0, 108.0, 108.0],
+            (0.25, 0.108, 0.108),
+            (250.0, 108.0, 108.0),
+            id="tczyx-nanometer",
+        ),
+        pytest.param(
+            [TimeAxisMeta(name="t"), *_space_axes("millimeter", "micrometer", "micrometer")],
+            (1, 4, 8, 8),
+            [1.0, 0.002, 0.5, 0.5],
+            (2.0, 0.5, 0.5),
+            (2000.0, 500.0, 500.0),
+            id="tzyx-mixed-units",
+        ),
+        pytest.param(
+            [ChannelAxisMeta(name="c"), *_space_axes("inch", "inch")],
+            (1, 8, 8),
+            [1.0, 0.5, 0.25],
+            (12700.0, 6350.0),
+            (12_700_000.0, 6_350_000.0),
+            id="cyx-inch",
+        ),
+    ],
+)
+def test_voxel_size_roundtrip(tmp_path, version, axes, shape, scale, micrometers, nanometers):
+    """The scale of the space axes, written in their units, reads back in any length unit."""
+    _write_scaled(tmp_path / "scaled.zarr", axes, shape, scale, version)
+    with open_ome_zarr(tmp_path / "scaled.zarr", mode="r") as position:
+        assert position.voxel_size() == micrometers
+        assert position.voxel_size("nanometer") == nanometers
+        assert position.voxel_size(image="0") == micrometers
+
+
+def test_voxel_size_levels_and_labels(tmp_path):
+    """Every resolution level reports its own size, from the transforms of the level and of the image."""
+    level_scale = [TransformationMeta(type="scale", scale=[1.0, 1.0, 2.0, 0.5, 0.5])]
+    with open_ome_zarr(tmp_path / "levels.zarr", layout="fov", mode="w-", channel_names=["a"]) as position:
+        position.create_zeros("0", shape=(1, 1, 4, 16, 16), dtype=np.uint16, transform=level_scale)
+        position.set_transform("*", [TransformationMeta(type="scale", scale=[1.0, 1.0, 1.0, 1.3, 1.3])])
+        position.initialize_pyramid(levels=2, dims={"y", "x"})
+        label = position.create_label_zeros("cells", shape=(1, 1, 4, 16, 16), dtype=np.uint32, transform=level_scale)
+        assert position.voxel_size() == (2.0, 0.65, 0.65)
+        assert position.voxel_size("nanometer", image="1") == (2000.0, 1300.0, 1300.0)
+        assert label.voxel_size("nanometer") == (2000.0, 500.0, 500.0)
+
+
+@pytest.mark.parametrize(
+    ("unit", "micrometers"),
+    [
+        ("angstrom", 1e-4),
+        ("picometer", 1e-6),
+        ("nanometer", 1e-3),
+        ("micrometer", 1.0),
+        ("millimeter", 1e3),
+        ("meter", 1e6),
+        ("kilometer", 1e9),
+        ("inch", 25_400.0),
+        ("foot", 304_800.0),
+        ("yard", 914_400.0),
+        ("mile", 1_609_344_000.0),
+        ("parsec", 3.0856775814913673e22),
+    ],
+)
+def test_voxel_size_unit_conversion(tmp_path, unit, micrometers):
+    """A unit voxel in each space unit has its length in micrometers, and is 1 in its own unit."""
+    _write_scaled(tmp_path / "unit.zarr", _space_axes(*[unit] * 3), (2, 2, 2), [1.0, 1.0, 1.0])
+    with open_ome_zarr(tmp_path / "unit.zarr", mode="r") as position:
+        assert position.voxel_size() == (micrometers,) * 3
+        assert position.voxel_size(unit) == (1.0, 1.0, 1.0)
+
+
+def test_voxel_size_knows_every_space_unit():
+    assert set(_METERS_PER_SPACE_UNIT) == set(get_args(SpaceUnit))
+
+
+def test_voxel_size_errors(tmp_path):
+    """Requests and axes without a known length are refused, naming what is wrong."""
+    axes = [ChannelAxisMeta(name="c"), SpaceAxisMeta(name="y", unit="micrometer"), SpaceAxisMeta(name="x")]
+    _write_scaled(tmp_path / "no_unit.zarr", axes, (1, 8, 8), [1.0, 0.5, 0.5])
+    with open_ome_zarr(tmp_path / "no_unit.zarr", mode="r") as position:
+        with pytest.raises(ValueError, match="Unknown length unit 'um'"):
+            position.voxel_size("um")
+        for image in ("1", "*"):
+            with pytest.raises(ValueError, match="not a resolution level"):
+                position.voxel_size(image=image)
+        # The specification allows an axis without a unit, but then its scale has no known length.
+        with pytest.raises(ValueError, match="Space axis 'x' declares no unit"):
+            position.voxel_size()
+        # Only reachable in memory: the axes model refuses a non-length unit when the store is read.
+        position.axes[1].unit = "second"
+        with pytest.raises(ValueError, match="Space axis 'y' has unit 'second', not a length"):
+            position.voxel_size()
 
 
 @pytest.mark.skip(reason="https://github.com/zarr-developers/zarr-python/issues/2407")
