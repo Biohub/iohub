@@ -120,9 +120,10 @@ The project uses [dependency groups](https://docs.astral.sh/uv/concepts/projects
 |-------|---------|
 | `test` | Testing tools (pytest, hypothesis, etc.) |
 | `acquire-zarr` | Acquire-zarr reader (requires glibc 2.35+) |
+| `torch` | CPU build of PyTorch, for the tests of `process_single_position(torch_device=...)` |
 | `doc` | Documentation (zensical, mkdocstrings, etc.) |
 | `pre-commit` | Pre-commit hooks |
-| `dev` | Includes test, acquire-zarr, doc, pre-commit (installed by default via `uv sync`) |
+| `dev` | Includes test, acquire-zarr, torch, doc, pre-commit (installed by default via `uv sync`) |
 
 > **Note**: On older glibc systems (e.g., Rocky Linux 8), `acquire-zarr` won't work. Use `uv sync --no-group acquire-zarr` instead.
 
