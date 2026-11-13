@@ -77,6 +77,11 @@ test = [
 acquire-zarr = [
     "acquire-zarr",
 ]
+# Not in dev, so a plain `uv sync` does not download it; CI adds `--group torch`.
+# 2.9 is the first torch with wheels for every Python iohub supports (3.12-3.14).
+torch = [
+    "torch>=2.9",
+]
 doc = [
     "zensical>=0.0.57",
     "mkdocstrings-python>=2.0.8",
@@ -103,6 +108,14 @@ packages = ["src/iohub"]
 
 [tool.uv.sources]
 mike = { git = "https://github.com/squidfunk/mike.git" }
+torch = { index = "pytorch-cpu" }
+
+# CPU-only wheels for the `torch` group: on Linux the PyPI wheel pulls in
+# several GB of CUDA libraries that the tests do not need.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.uv-dynamic-versioning]
 vcs = "git"

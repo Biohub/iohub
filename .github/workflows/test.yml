@@ -36,7 +36,8 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --group test
+        # torch is not in dev; without it the torch_device tests would skip.
+        run: uv sync --group test --group torch
 
       # tests/conftest.py downloads these on first import and skips files that
       # are already present; it holds the URLs, so its hash keys the cache.
