@@ -16,6 +16,7 @@ import hypothesis.strategies as st
 import numpy as np
 import pytest
 import xarray as xr
+import zarr
 from hypothesis import assume, given, settings
 from numpy.typing import DTypeLike
 
@@ -3122,3 +3123,64 @@ def test_apply_transform_label_output_ignores_the_channel_selection(tmp_path):
         labels = position.get_label("nuclei")["0"][:]
         assert labels.shape == (2, 1, 3, 8, 8)
         np.testing.assert_array_equal(labels[:, 0], np.rint(position.data[:, 1] * 2).astype(np.uint32))
+
+
+# -- Open positions in place of paths ---------------------------------------
+
+
+@pytest.mark.parametrize(("num_workers", "use_threads"), [(1, False), (2, True), (2, False)])
+def test_process_single_position_takes_open_positions(tmp_path, num_workers, use_threads):
+    """Open positions give what their paths give, and the caller's nodes stay usable."""
+    shape = (2, 2, 2, 4, 4)
+    position_key = ("A", "1", "0")
+    input_store, output_store = _make_stores(tmp_path / "nodes", shape, position_key)
+    path_output_store = tmp_path / "paths.zarr"
+    create_empty_plate(path_output_store, [position_key], ["c0", "c1"], shape)
+    input_path = input_store / Path(*position_key)
+    output_path = output_store / Path(*position_key)
+    options = {"constant": 3, "extra_metadata": {"test-step": {"v": 1}}, "num_workers": num_workers}
+
+    process_single_position(dummy_transform, input_path, path_output_store / Path(*position_key), **options)
+    with open_ome_zarr(input_path) as source, open_ome_zarr(output_path, mode="r+") as target:
+        process_single_position(dummy_transform, source, target, use_threads=use_threads, **options)
+        # The caller's node reads the new data and the metadata written for it ...
+        np.testing.assert_array_almost_equal(target.data[:], dummy_transform(source.data[:], constant=3))
+        assert target.zattrs["test-step"] == {"v": 1}
+        # ... and writing metadata through it later keeps that metadata.
+        target.zattrs["later"] = 1
+
+    with open_ome_zarr(path_output_store / Path(*position_key)) as by_path, open_ome_zarr(output_path) as by_node:
+        np.testing.assert_array_equal(by_node.data[:], by_path.data[:])
+        assert dict(by_node.zattrs) == dict(by_path.zattrs) | {"later": 1}
+
+
+def test_process_single_position_refuses_a_read_only_output(tmp_path):
+    shape = (1, 1, 2, 4, 4)
+    position_key = ("A", "1", "0")
+    input_store, output_store = _make_stores(tmp_path, shape, position_key)
+    with open_ome_zarr(output_store / Path(*position_key)) as target:
+        with pytest.raises(ValueError, match=r"open read-only; open it with mode='r\+'"):
+            process_single_position(dummy_transform, input_store / Path(*position_key), target)
+        assert not target.data[:].any()
+
+
+def test_process_single_position_refuses_a_position_outside_a_directory_store(tmp_path):
+    shape = (1, 1, 2, 4, 4)
+    position_key = ("A", "1", "0")
+    _, output_store = _make_stores(tmp_path, shape, position_key)
+    with open_ome_zarr(zarr.storage.MemoryStore(), mode="w", layout="fov", channel_names=["c0"]) as source:
+        source.create_zeros("0", shape=shape, dtype=np.float32)
+        with pytest.raises(ValueError, match=r"MemoryStore.*local directory store"):
+            process_single_position(dummy_transform, source, output_store / Path(*position_key))
+
+
+def test_apply_transform_to_tczyx_and_save_takes_open_positions(tmp_path):
+    shape = (2, 2, 2, 4, 4)
+    position_key = ("A", "1", "0")
+    input_store, output_store = _make_stores(tmp_path, shape, position_key)
+    with open_ome_zarr(input_store) as source_plate, open_ome_zarr(output_store, mode="r+") as target_plate:
+        source, target = source_plate["A/1/0"], target_plate["A/1/0"]
+        apply_transform_to_tczyx_and_save(dummy_transform, source, target, [1], [0], [0, 1], [1, 0], constant=2)
+        written = target.data[:]
+        np.testing.assert_array_almost_equal(written[[1, 0], 0], dummy_transform(source.data[:, 1], constant=2))
+        assert not written[:, 1].any()
