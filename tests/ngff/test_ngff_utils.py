@@ -603,6 +603,26 @@ def test_create_empty_plate_deduplicates_equivalent_keys(version):
             assert [image.path for image in plate["A/1"].metadata.images] == ["0"]
 
 
+@pytest.mark.parametrize("version", ["0.4", "0.5"])
+def test_create_empty_plate_voxel_size(tmp_path, version):
+    """Every position of a plate created with a scale has that voxel size, in micrometers."""
+    store_path = tmp_path / "plate.zarr"
+    create_empty_plate(
+        store_path=store_path,
+        position_keys=[("A", "1", "0"), ("B", "2", "0")],
+        channel_names=["DAPI"],
+        shape=(1, 1, 4, 8, 8),
+        scale=(1, 1, 2.0, 0.65, 0.65),
+        version=version,
+    )
+    with open_ome_zarr(store_path, mode="r") as plate:
+        positions = [position for _, position in plate.positions()]
+        assert len(positions) == 2
+        for position in positions:
+            assert position.voxel_size() == (2.0, 0.65, 0.65)
+            assert position.voxel_size("nanometer") == (2000.0, 650.0, 650.0)
+
+
 def test_create_empty_plate_copy_metadata_from():
     """Test that metadata_sources copies custom zattrs but not labels."""
     position_keys = [("A", "1", "0"), ("A", "1", "1")]

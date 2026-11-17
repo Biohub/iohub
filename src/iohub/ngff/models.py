@@ -97,39 +97,40 @@ class ChannelAxisMeta(NamedAxisMeta):
     type: Literal["channel"] = "channel"
 
 
+SpaceUnit = Literal[
+    "angstrom",
+    "attometer",
+    "centimeter",
+    "decimeter",
+    "exameter",
+    "femtometer",
+    "foot",
+    "gigameter",
+    "hectometer",
+    "inch",
+    "kilometer",
+    "megameter",
+    "meter",
+    "micrometer",
+    "mile",
+    "millimeter",
+    "nanometer",
+    "parsec",
+    "petameter",
+    "picometer",
+    "terameter",
+    "yard",
+    "yoctometer",
+    "yottameter",
+    "zeptometer",
+    "zettameter",
+]
+"""The OME-NGFF units of space axes: the UDUNITS-2 length units."""
+
+
 class SpaceAxisMeta(NamedAxisMeta):
     type: Literal["space"] = "space"
-    unit: (
-        Literal[
-            "angstrom",
-            "attometer",
-            "centimeter",
-            "decimeter",
-            "exameter",
-            "femtometer",
-            "foot",
-            "gigameter",
-            "hectometer",
-            "inch",
-            "kilometer",
-            "megameter",
-            "meter",
-            "micrometer",
-            "mile",
-            "millimeter",
-            "nanometer",
-            "parsec",
-            "petameter",
-            "picometer",
-            "terameter",
-            "yard",
-            "yoctometer",
-            "yottameter",
-            "zeptometer",
-            "zettameter",
-        ]
-        | None
-    ) = None
+    unit: SpaceUnit | None = None
 
 
 class TimeAxisMeta(NamedAxisMeta):
